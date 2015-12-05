@@ -17,7 +17,7 @@ class SubjectAdmin:
         self.devilry_url = devilry_url
         self.rest_url = f'{devilry_url}/devilry_subjectadmin/rest'
         self.period = None
-        self.session = FuturesSession(max_workers=16)
+        self.session = FuturesSession(max_workers=24)
         self.auth(username, password)
 
     def auth(self, username, password):
@@ -210,7 +210,17 @@ class SubjectAdmin:
         return futures
 
     def close_groups_without_deliveries(self, assignment):
-        NotImplemented
+        r = self.get(f'group/{assignment}/').result()
+        futures = []
+        for group in r.data:
+            if group['num_deliveries'] == 0:
+                futures.append(self.put(f'group/{assignment}/',
+                                        json={'id': group['id'],
+                                              'is_open': False,
+                                              'candidates': group['candidates'],
+                                              'examiners': group['examiners'],
+                                              'tags': group['tags']}))
+        return futures
 
     def set_deadline_text(self, assignment, text):
         dls = self.get(f'deadlinesbulk/{assignment}').result().data
