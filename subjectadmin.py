@@ -1,4 +1,6 @@
-import requests
+import asyncio
+from requests_futures.sessions import FuturesSession
+from functools import lru_cache
 from warnings import warn
 
 def needs_period(method):
@@ -15,7 +17,7 @@ class SubjectAdmin:
         self.devilry_url = devilry_url
         self.rest_url = f'{devilry_url}/devilry_subjectadmin/rest'
         self.period = None
-        self.session = requests.Session()
+        self.session = FuturesSession(max_workers=24)
         self.auth(username, password)
 
     def auth(self, username, password):
@@ -23,41 +25,41 @@ class SubjectAdmin:
         login_url = f'{self.devilry_url}/authenticate/login'
         r = self.session.post(login_url,
                           {'username': username, 'password': password},
-                          allow_redirects=False)
-        self.cookies = r.cookies
+                          allow_redirects=False).result()
         if not r.ok:
             raise ConnectionError('Auth failed')
 
-    def get(self, url, **kwargs):
-        return requests.get(f'{self.rest_url}/{url}',
-                            cookies=self.cookies, **kwargs)
+    @staticmethod
+    def _json_cb(sess, resp):
+        resp.data = resp.json()
+
+    def get(self, url, *, cb=None, **kwargs):
+        cb = cb if not cb is None else self._json_cb
+        return self.session.get(f'{self.rest_url}/{url}', **kwargs,
+                                background_callback=cb)
 
     def post(self, url, **kwargs):
-        return requests.post(f'{self.rest_url}/{url}', cookies=self.cookies,
-                             auth=self.creds, **kwargs)
+        return self.session.post(f'{self.rest_url}/{url}', **kwargs,
+                                 auth=self.creds)
 
     def put(self, url, **kwargs):
-        return requests.put(f'{self.rest_url}/{url}',
-                            cookies=self.cookies, auth=self.creds, **kwargs)
+        return self.session.put(f'{self.rest_url}/{url}', **kwargs,
+                                auth=self.creds)
 
     def delete(self, url, **kwargs):
-        return requests.delete(f'{self.rest_url}/{url}', cookies=self.cookies,
-                               auth=self.creds, **kwargs)
+        return self.session.delete(f'{self.rest_url}/{url}', **kwargs,
+                                   auth=self.creds)
 
     def periods(self):
-        r = self.get('allwhereisadmin')
+        courses = self.get('allwhereisadmin').result().data
         periods = []
-        for course in r.json():
+        for course in courses:
             for period in course['periods']:
                 periods.append({'course': course, 'period': period})
         return periods
 
     def set_period(self, period):
         self.period = period
-        r = self.get(f"period/{period['id']}")
-        # course_id = r.json()['breadcrumb'][-2]['id']
-        # r = self.get(f'subject/{course_id}')
-        # self.course = r.json()
 
     @needs_period
     def create_assignment(self, *, short_name, long_name, first_deadline,
@@ -68,57 +70,44 @@ class SubjectAdmin:
         post_data['first_deadline'] = first_deadline.strftime('%F %T')
         post_data['publishing_time'] = publishing_time.strftime('%F %T')
         post_data['period_id'] = self.period['id']
-        r = self.post('createnewassignment/', json=post_data)
-        if r.ok:
-            return r.json()
-        warn(f'Could not create assignment: {r.text}\n{r.reason}')
+        return self.post('createnewassignment/', json=post_data,
+                         background_callback=self._json_cb)
 
     def set_hard_deadlines(self, assignment_id):
-        r = self.get(f'assignment/{assignment_id}')
-        if not r.ok:
-            warn(f'Could not get assignment info: {r.reason}\n{r.text}')
-            return
-        assignment = r.json()
-        assignment['deadline_handling'] = 1
-        r = self.put(f'assignment/{assignment_id}', json=assignment)
-        if not r.ok:
-            warn(f'Could not update assignment: {r.text}\n{r.reason}')
+        def task():
+            r = self.get(f'assignment/{assignment_id}').result()
+            assignment = r.data
+            assignment['deadline_handling'] = 1
+            r = self.put(f'assignment/{assignment_id}', json=assignment).result()
+        return self.session.executor.submit(task)
 
     def set_points_assignment(self, assignment_id, min_points=0,
                               *, max_points, display_points=True):
-        r = self.get(f'assignment/{assignment_id}')
-        if not r.ok:
-            warn(f'Could not get assignment info: {r.reason}\n{r.text}')
-            return
-        points2grade = 'raw-points' if display_points else 'passed-failed'
-        assignment = r.json()
-        assignment['max_points'] = max_points
-        assignment['passing_grade_min_points'] = min_points
-        assignment['points_to_grade_mapper'] = points2grade
-        assignment['grading_system_plugin_id'] = \
-                                'devilry_gradingsystemplugin_points'
-        r = self.put(f'assignment/{assignment_id}', json=assignment)
-        if not r.ok:
-            warn(f'Could not update assignment: {r.text}\n{r.reason}')
+        def task():
+            r = self.get(f'assignment/{assignment_id}').result()
+            points2grade = 'raw-points' if display_points else 'passed-failed'
+            assignment = r.data
+            assignment['max_points'] = max_points
+            assignment['passing_grade_min_points'] = min_points
+            assignment['points_to_grade_mapper'] = points2grade
+            assignment['grading_system_plugin_id'] = \
+                                    'devilry_gradingsystemplugin_points'
+            r = self.put(f'assignment/{assignment_id}', json=assignment).result()
+        return self.session.executor.submit(task)
 
     def examiner_stats(self, assignment_id):
-        r = self.get(f'examinerstats/{assignment_id}')
-        if r.ok:
-            return r.json()
-        warn(f'Couldn\'t get examiner stats:\n{r.reason}\n{r.text}')
+        return self.get(f'examinerstats/{assignment_id}')
 
     def set_examiner(self, student, examiner, assignment):
-        r = self.post(f'group/{assignment}/',
-                          json={'candidates': [{'user': {'id': student}}],
-                                'examiners': [{'user': examiner['user']}],
-                                'is_open': True})
-        if not r.ok:
-            warn(f"Could not set examiner {examiner['user']['username']}"
-                 f" to student {student}.\n{r.reason}\n{r.text}")
+        return self.post(f'group/{assignment}/',
+                         json={'candidates': [{'user': {'id': student}}],
+                               'examiners': [{'user': examiner['user']}],
+                               'is_open': True})
 
+    @lru_cache(maxsize=64)
     def find_person(self, username):
-        r = requests.get(f'{self.devilry_url}/devilry_usersearch/search'
-                         f'?query={username}', cookies=self.cookies)
+        r = self.session.get(f'{self.devilry_url}/devilry_usersearch/search'
+                             f'?query={username}').result()
         if not r.ok:
             warn(f'Search could not be completed: {r.text}\n{r.reason}')
             return
@@ -127,105 +116,148 @@ class SubjectAdmin:
                 return user
 
     def set_tags(self, assignment):
-        r = self.get(f'group/{assignment}/')
-        s = self.get(f'relatedstudent_assignment_ro/{assignment}/').json()
+        groups = self.get(f'group/{assignment}/').result().data
+        students = self.get(f'relatedstudent_assignment_ro/{assignment}/')\
+                       .result().data
         def get_tags(student):
-            for st in s:
+            for st in students:
                 if student == st['user']['id']:
                     return [{'tag': t} for t in st['tags'].split(',')]
-        for group in r.json():
-            t = self.put(f'group/{assignment}/',
+        futures = []
+        for group in groups:
+            # TODO: Copy ALL tags
+            f = self.put(f'group/{assignment}/',
                          json={'id': group['id'],
                                'candidates': [group['candidates'][0]],
                                'examiners': group['examiners'],
                                'is_open': True,
-                               'tags': get_tags(group['candidates'][0]['user']['id'])})
-            if t.ok:
-                print(f"Updated {group['candidates'][0]['user']['username']}")
-            else:
-                print(t.reason, t.text)
-
+                               'tags': get_tags(group['candidates'][0]
+                                                ['user']['id'])})
+            futures.append(f)
+        return futures
 
     def get_group(self, username, assignment):
-        r = self.get(f'group/{assignment}/?query={username}')
-        if not r.ok:
-            warn(f'Search could not be completed: {r.text}\n{r.reason}')
-            return
-        for group in r.json():
-            if group['candidates'][0]['user']['username'] == username:
-                return group
+        def cb(sess, resp):
+            for group in resp.json():
+                if group['candidates'][0]['user']['username'] == username:
+                    resp.data = group
+                    return
+        return self.get(f'group/{assignment}/?query={username}', cb=cb)
 
     def update_examiner(self, group, examiner, assignment):
         examiners = [] if examiner is None else [{'user': examiner['user']}]
-        r = self.put(f'group/{assignment}/',
-                     json={'id': group['id'],
-                           'candidates': [group['candidates'][0]],
-                           'examiners': examiners,
-                           'is_open': True,
-                           'tags': group['tags']})
-        if not r.ok:
-            warn(f"Could not set examiner "
-                 f"{examiner['user']} to group "
-                 f"{group['id']}.\n{r.reason}\n{r.text}")
+        return self.put(f'group/{assignment}/',
+                        json={'id': group['id'],
+                              'candidates': [group['candidates'][0]],
+                              'examiners': examiners,
+                              'is_open': True,
+                              'tags': group['tags']})
 
     def remove_students(self, students, assignment):
-        for student in students:
-            r = self.get(f'group/{assignment}/?query={student}')
-            for group in r.json():
+        def remove(student):
+            r = self.get(f'group/{assignment}/?query={student}').result()
+            for group in r.data:
                 if group['candidates'][0]['user']['username'] == student:
                     break
             else:
                 return
-            r = self.delete(f'group/{assignment}/', json={'id': group['id']})
+            return self.delete(f'group/{assignment}/',
+                               json={'id': group['id']}).result()
+        return [self.session.executor.submit(remove, student)
+                for student in students]
 
     def remove_students_by_tag(self, tag, assignment):
-        r = self.get(f'group/{assignment}/?query={tag}')
-        for group in r.json():
+        r = self.get(f'group/{assignment}/?query={tag}').result()
+        futures = []
+        for group in r.data:
             if tag in map(lambda x: x['tag'], group['tags']):
-                r = self.delete(f'group/{assignment}/', json={'id': group['id']})
+                futures.append(self.delete(f'group/{assignment}/',
+                                           json={'id': group['id']}))
+        return futures
 
     def add_students(self, students, assignment):
-        for student in students:
-            r = self.get(f"relatedstudent/{self.period['id']}?query={student}")
+        async def add(student):
+            r = await asyncio.wrap_future(
+                self.get(f"relatedstudent/{self.period['id']}?query={student}"))
             if not r.ok:
                 warn(f'Student {student} could not be found:\n{r.text}')
             for stud in r.json():
                 if stud['user']['username'] == student:
                     break
             stud_id = stud['user']['id']
-            r = self.post(f'group/{assignment}/',
+            r = await asyncio.wrap_future(self.post(f'group/{assignment}/',
                           json={'candidates': [{'user': {'id': stud_id}}],
-                                'is_open': True})
+                                'is_open': True}))
             if not r.ok:
                 warn(f'Student {student} could not be added:\n{r.text}')
+        loop = asyncio.get_event_loop()
+        g = asyncio.gather(*[add(student) for student in students])
+        loop.run_until_complete(g)
 
     def setup_examiners_by_tags(self, assignment):
-        r = self.get(f"relatedexaminer/{self.period['id']}")
-        emap = {exr['tags']: exr['user']['id'] for exr in r.json()}
-        r = self.get(f'group/{assignment}/')
-        for group in r.json():
+        r = self.get(f"relatedexaminer/{self.period['id']}").result()
+        emap = {exr['tags']: exr['user']['id'] for exr in r.data}
+        r = self.get(f'group/{assignment}/').result()
+        futures = []
+        for group in r.data:
             for tag in group['tags']:
                 t = tag['tag']
                 if not t in emap:
                     continue
-                self.update_examiner(group, {'user': {'id': emap[t]}}, assignment)
+                futures.append(self.update_examiner(group,
+                                                    {'user': {'id': emap[t]}},
+                                                    assignment))
+        return futures
 
     def close_groups_without_deliveries(self, assignment):
-        NotImplemented
+        r = self.get(f'group/{assignment}/').result()
+        futures = []
+        for group in r.data:
+            if group['num_deliveries'] == 0:
+                futures.append(self.put(f'group/{assignment}/',
+                                        json={'id': group['id'],
+                                              'is_open': False,
+                                              'candidates': group['candidates'],
+                                              'examiners': group['examiners'],
+                                              'tags': group['tags']}))
+        return futures
 
     def set_deadline_text(self, assignment, text):
-        r = self.get(f'deadlinesbulk/{assignment}')
-        dls = r.json()
+        dls = self.get(f'deadlinesbulk/{assignment}').result().data
+        futures = []
         for dl in dls:
             if dl['text'] is None:
-                r = self.put(f"deadlinesbulk/{assignment}/{dl['bulkdeadline_id']}",
-                             json={'text': text,
-                                   'deadline': dl['deadline']})
-                if not r.ok:
-                    warn(f'Could not set deadline text: {r.reason}\n{r.text}')
+                futures.append(
+            self.put(f"deadlinesbulk/{assignment}/{dl['bulkdeadline_id']}",
+                     json={'text': text,
+                           'deadline': dl['deadline']}))
+        return futures
 
     def remove_examiner_no_delivery(self, assignment):
-        r = self.get(f'group/{assignment}/')
-        for group in r.json():
+        r = self.get(f'group/{assignment}/').result()
+        futures = []
+        for group in r.data:
             if not group['num_deliveries']:
-                self.update_examiner(group, None, assignment)
+                futures.append(self.update_examiner(group, None,
+                                                    assignment))
+
+    @needs_period
+    def points(self):
+        import pandas as pd
+        ov = {}
+        r = self.get(f"detailedperiodoverview/{self.period['id']}")
+        data = r.result().data
+        assignments = {a['id']: a['short_name'] for a in data['assignments']}
+        for student in r.result().data['relatedstudents']:
+            name = student['user']['username']
+            stdict = {}
+            for assignment in student['groups_by_assignment']:
+                a_name = assignments[assignment['assignmentid']]
+                if assignment['grouplist'] and assignment['grouplist'][0]['feedback']:
+                    stdict[a_name] = assignment['grouplist'][0]['feedback']['points']
+            tag = student['relatedstudent']['tags'].split(',')[-1]
+            stdict['group'] = tag.replace('gruppe', '') if 'gruppe' in tag else None
+            ov[name] = stdict
+        df = pd.DataFrame(ov).T
+        df.set_index([df.index, 'group'], inplace=True)
+        return df
