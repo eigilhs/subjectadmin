@@ -243,6 +243,7 @@ class SubjectAdmin:
 
     @needs_period
     def points(self):
+        import pandas as pd
         ov = {}
         r = self.get(f"detailedperiodoverview/{self.period['id']}")
         data = r.result().data
@@ -254,6 +255,9 @@ class SubjectAdmin:
                 a_name = assignments[assignment['assignmentid']]
                 if assignment['grouplist'] and assignment['grouplist'][0]['feedback']:
                     stdict[a_name] = assignment['grouplist'][0]['feedback']['points']
-            stdict['group'] = student['relatedstudent']['tags']
+            tag = student['relatedstudent']['tags'].split(',')[-1]
+            stdict['group'] = tag.replace('gruppe', '') if 'gruppe' in tag else None
             ov[name] = stdict
-        return ov
+        df = pd.DataFrame(ov).T
+        df.set_index([df.index, 'group'], inplace=True)
+        return df
